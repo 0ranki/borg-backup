@@ -1,0 +1,120 @@
+#!/bin/bash
+
+## Create /root/.borg_env.d containing one or more .repo files
+## With the following content:
+# export BORG_REPO_NICK='reponame @ location'
+# export BORG_REPO='/repo/path_or_user@host:reponame'
+# export BORG_PASSPHRASE='repo-password'
+# export BORG_SOURCE='/path/to/source/directory'
+# DBHOST='database.example.com'
+# DB='database'
+# DBUSER='dbuser'
+# DBPASSWD='database-password'
+
+## Run as root to be able to back up files owned by multiple users and avoid errors
+if [[ "$UID" -ne 0 ]]; then
+	echo "This script needs root permissions."
+	exit 1
+fi
+
+## Log file:
+APP_NAME=gitea
+LOG_FILE="/var/log/borg-${APP_NAME}.log"
+STATUS_FILE='/var/local/backup-status'
+ZFS_DATASET=''
+SANOID=0
+PRUNE_REPO=0
+
+function application () {
+	# A single place to define the commands to start and stop the service to have consistent data in the backups
+	if [[ "$1" == "start" ]]; then
+		systemctl start $APP_NAME.service
+	elif [[ "$1" == "stop" ]]; then
+		systemctl stop $APP_NAME.service
+	fi
+}
+
+function exit_on_error () {	
+	if [[ "$EXIT_CODE" -ne 0 ]]; then
+		echo "**ERROR**: There was a problem with backups on $(date)." | tee -a $LOG_FILE | tee -a $STATUS_FILE
+		application start
+		tac $LOG_FILE | sed -n '0,/-----.*$/p' | tac | mail -s "**ERROR**: There was a problem with $APP_NAME backups on $(date)" system
+		exit $EXIT_CODE
+	fi
+}
+
+## Get todays snapshot tag (for use with sanoid, not 100% reliable with db)
+[[ "$SANOID" -eq 1 ]] && [[ ! -z "$ZFS_DATASET" ]] && TAG=$(zfs list -o name -t snapshot $ZFS_DATASET | grep daily | grep $(date +%Y-%m-%d) | sed 's/^.*@//')
+
+DATA_DIR='/data'
+
+echo -e "\n------ $(date +%A_%Y-%m-%d) ------\n" >> $LOG_FILE
+
+## Stop the application
+application stop
+
+echo -e " - Waiting 60 seconds..." | tee -a $LOG_FILE
+sleep 60
+
+if [[ -z "$1" ]]; then
+	TAG="auto_$(date +%Y-%m-%d)"
+else
+	TAG=$1
+fi
+
+EXIT_CODE=0
+ARCHIVE_NAME=$TAG
+
+for SOURCE in ~/.borg_env.d/*.repo; do
+
+	## Environment
+	source $SOURCE 
+
+	## Database dump
+	echo "Creating database dump..." | tee -a $LOG_FILE
+	mysqldump --single-transaction -h $DBHOST -u $DBUSER -p${DBPASSWD} $DB 1> ${DATA_DIR}/${APP_NAME}-db.dmp
+
+	let EXIT_CODE=$EXIT_CODE+$?
+	exit_on_error
+	
+	if [[ ! -z "$ZFS_DATASET" ]] && [[ "$SANOID" -eq 0 ]]; then
+		echo "Creating snapshot..." | tee -a $LOG_FILE
+		/usr/sbin/zfs snapshot -r ${ZFS_DATASET}@${TAG} &>> $LOG_FILE
+		let EXIT_CODE=$EXIT_CODE+$?
+		exit_on_error
+
+		# Start the application
+		application start
+	fi
+
+	cd ${BORG_SOURCE}
+	echo "Using $PWD as source " | tee -a $LOG_FILE
+	if [[ "$2" == "-i" ]]; then
+	       	borg create --progress ::$ARCHIVE_NAME .
+	else
+		borg create --stats ::$ARCHIVE_NAME . &>> $LOG_FILE
+	fi
+
+	let EXIT_CODE=$EXIT_CODE+$?
+	exit_on_error
+
+	if [[ "$PRUNE_REPO" -eq 1 ]]; then
+		borg prune                          \
+		    --list                          \
+		    --prefix=auto                   \
+		    --keep-daily    14              \
+		    --keep-weekly   8               \
+		    --keep-monthly  6 		    \
+			&>> $LOG_FILE     
+
+		let EXIT_CODE=$EXIT_CODE+$?
+		exit_on_error
+	fi
+
+done
+
+application start
+echo "Succesfully created $ARCHIVE_NAME!" | tee -a $LOG_FILE
+sed -i "s/^Latest ${APP_NAME} backup on.*$/Latest ${APP_NAME} backup on $(date)/" $STATUS_FILE
+
+exit $EXIT_CODE
